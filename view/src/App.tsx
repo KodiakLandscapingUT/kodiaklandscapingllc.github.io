@@ -451,9 +451,9 @@ function Welcome({ draft, onStart, onContinue, onDelete }: { draft: ApplicationD
           )}
         </Box>
         <Box component="section" className="animate-rise" sx={{ position: 'relative', pl: { lg: 4 }, animationDelay: '100ms' }}>
-          <Box sx={{ position: 'relative', overflow: 'hidden', borderRadius: 6, bgcolor: 'secondary.main', p: { xs: 3.5, sm: 5 }, color: 'primary.contrastText', boxShadow: '12px 12px 0 rgba(199,52,47,0.85)' }}>
+          <Box sx={{ position: 'relative', overflow: 'hidden', borderRadius: 6, bgcolor: 'primary.main', p: { xs: 3.5, sm: 5 }, color: 'primary.contrastText', boxShadow: '12px 12px 0 rgba(199,52,47,0.85)' }}>
             <Box sx={{ position: 'absolute', right: -56, top: -64, height: 192, width: 192, borderRadius: '50%', border: '18px solid', borderColor: 'warning.main', opacity: 0.9 }} />
-            <Box sx={{ position: 'absolute', bottom: -96, left: -48, height: 192, width: 192, borderRadius: '50%', border: '18px solid', borderColor: 'primary.main', opacity: 0.7 }} />
+            <Box sx={{ position: 'absolute', bottom: -96, left: -48, height: 192, width: 192, borderRadius: '50%', border: '18px solid', borderColor: 'warning.main', opacity: 0.7 }} />
             <Box sx={{ position: 'relative' }}>
               <Typography className="mono-label" sx={{ color: 'warning.main' }}>{t.know}</Typography>
               <Box sx={{ mt: 4, display: 'flex', flexDirection: 'column', gap: 3 }}>
