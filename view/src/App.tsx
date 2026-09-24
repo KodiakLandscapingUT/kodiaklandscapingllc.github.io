@@ -10,6 +10,7 @@ import {
   Button,
   Checkbox,
   Chip,
+  Divider,
   CssBaseline,
   FormControlLabel,
   MenuItem,
@@ -29,8 +30,8 @@ import {
 import { ErrorBoundary } from '@/components/error-boundary';
 import NotFound from '@/pages/not-found';
 import { Route, Switch, Router as WouterRouter, Link } from 'wouter';
-import { generateProfilePDF } from '@/lib/pdf';
-import { firebaseAuth } from '@/lib/firebase';
+import { generateProfilePDF, mergePDFs } from '@/lib/pdf';
+import { firebaseAuth, signInWithGoogle } from '@/lib/firebase';
 const queryClient = new QueryClient();
 type ColorMode = 'light' | 'dark';
 const COLOR_MODE_KEY = 'kodiak-color-mode';
@@ -404,7 +405,7 @@ function BrandMark() {
       </Box>
       <Box sx={{ minWidth: 0 }}>
         <Typography className="font-display" sx={{ fontSize: '1.125rem', fontWeight: 'bold', lineHeight: 1, letterSpacing: '-0.03em' }}>KODIAK</Typography>
-        <Typography className="mono-label" sx={{ mt: 0.5, fontSize: '0.58rem', color: 'text.secondary', display: { xs: 'none', sm: 'block' } }}>Landscaping + Construction</Typography>
+        <Typography className="mono-label" sx={{ mt: 0.5, fontSize: '0.58rem', color: 'text.secondary', display: { xs: 'none', sm: 'block' } }}>Landscaping &amp; Construction</Typography>
       </Box>
     </Box>
   );
@@ -749,15 +750,16 @@ function Submitted({ onRestart, data }: { onRestart: () => void; data: Applicati
   const { t, lang } = useContext(LangContext);
   const [isGenerating, setIsGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [, setW4Error] = useState(false);
-
+  // The IRS does not send CORS headers, so the W-4 is proxied by the API,
+  // which also records any failure for later review.
   const fetchPdfBytes = async (url: string): Promise<Uint8Array | null> => {
     try {
       const res = await fetch(url);
       if (!res.ok) throw new Error('Fetch failed');
       const arrayBuffer = await res.arrayBuffer();
-      return new Uint8Array(arrayBuffer);
-    } catch (e) {
+      // 204 (nothing configured) arrives as an empty, unloadable body.
+      return arrayBuffer.byteLength === 0 ? null : new Uint8Array(arrayBuffer);
+    } catch {
       return null;
     }
   };
@@ -765,19 +767,21 @@ function Submitted({ onRestart, data }: { onRestart: () => void; data: Applicati
   const handleDownload = async () => {
     setIsGenerating(true);
     setError(null);
-    setW4Error(false);
 
     try {
       const profilePdfBytes = await generateProfilePDF(data, lang);
-      
-      const w4Url = lang === 'es' ? 'https://www.irs.gov/pub/irs-pdf/fw4sp.pdf' : 'https://www.irs.gov/pub/irs-pdf/fw4.pdf';
-      const w4Bytes = await fetchPdfBytes(w4Url);
-      
-      if (!w4Bytes) {
-        setW4Error(true);
-      }
 
-      const blob = new Blob([profilePdfBytes.buffer as ArrayBuffer], { type: 'application/pdf' });
+      const [w4Bytes, attachmentBytes] = await Promise.all([
+        fetchPdfBytes(`${apiBaseUrl}/forms/w4?lang=${lang}`),
+        // Active admin-uploaded templates, already merged in order by the API.
+        fetchPdfBytes(`${apiBaseUrl}/forms/attachments?lang=${lang}`),
+      ]);
+
+      // Whatever is unavailable is skipped: the applicant still gets a packet.
+      const parts = [profilePdfBytes, w4Bytes, attachmentBytes].filter((part): part is Uint8Array => part !== null);
+      const pdfBytes = parts.length > 1 ? await mergePDFs(parts) : profilePdfBytes;
+
+      const blob = new Blob([pdfBytes.buffer as ArrayBuffer], { type: 'application/pdf' });
       const link = document.createElement('a');
       link.href = URL.createObjectURL(blob);
       link.download = `Kodiak_Profile_${data.firstName}_${data.lastName}.pdf`;
@@ -854,6 +858,177 @@ function Home() {
   );
 }
 
+// --- PDF templates ---
+
+type PdfTemplate = {
+  id: string; name: string; lang: 'en' | 'es' | 'both'; active: boolean;
+  order: number; size: number; pageCount: number; uploadedByEmail: string; updatedAt: string | null;
+};
+
+type AuthOptions = () => Promise<{ headers: Record<string, string>; cache: RequestCache }>;
+
+const apiBaseUrl = `${import.meta.env.BASE_URL.replace(/\/$/, '')}/api`;
+
+function formatSize(bytes: number) {
+  return bytes < 1024 * 1024 ? `${Math.round(bytes / 1024)} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function PdfTemplates({ authOptions }: { authOptions: AuthOptions }) {
+  const [templates, setTemplates] = useState<PdfTemplate[]>([]);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [file, setFile] = useState<File | null>(null);
+  const [name, setName] = useState('');
+  const [lang, setLang] = useState<'en' | 'es' | 'both'>('both');
+  const [order, setOrder] = useState('0');
+
+  const request = async <T,>(path: string, init: RequestInit = {}): Promise<T | null> => {
+    const auth = await authOptions();
+    const response = await fetch(`${apiBaseUrl}${path}`, {
+      ...init,
+      cache: auth.cache,
+      headers: { ...auth.headers, ...init.headers },
+    });
+    if (!response.ok) {
+      const detail = (await response.json().catch(() => null)) as { error?: string } | null;
+      throw new Error(detail?.error ?? `Request failed (${response.status})`);
+    }
+    return response.status === 204 ? null : ((await response.json()) as T);
+  };
+
+  const load = async () => {
+    try {
+      setTemplates((await request<PdfTemplate[]>('/pdf-templates')) ?? []);
+      setError('');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not load templates.');
+    }
+  };
+
+  useEffect(() => { load(); }, []);
+
+  const run = async (action: () => Promise<unknown>) => {
+    setBusy(true);
+    setError('');
+    try {
+      await action();
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'That did not work.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const upload = () => run(async () => {
+    if (!file) throw new Error('Choose a PDF first.');
+    const query = new URLSearchParams({
+      name: name.trim() || file.name.replace(/\.pdf$/i, ''),
+      lang,
+      order: order.trim() || '0',
+    });
+    await request(`/pdf-templates?${query}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/pdf' },
+      body: file,
+    });
+    setFile(null);
+    setName('');
+    setOrder('0');
+  });
+
+  const patch = (id: string, body: Partial<Pick<PdfTemplate, 'name' | 'lang' | 'active' | 'order'>>) => run(() =>
+    request(`/pdf-templates/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  );
+
+  const remove = (template: PdfTemplate) => {
+    if (!window.confirm(`Delete "${template.name}"? Applicants will stop receiving it.`)) return;
+    return run(() => request(`/pdf-templates/${template.id}`, { method: 'DELETE' }));
+  };
+
+  const download = async (template: PdfTemplate) => {
+    try {
+      const auth = await authOptions();
+      const response = await fetch(`${apiBaseUrl}/pdf-templates/${template.id}/file`, { headers: auth.headers });
+      if (!response.ok) throw new Error(`Request failed (${response.status})`);
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `${template.name}.pdf`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Could not download that template.');
+    }
+  };
+
+  return (
+    <Paper variant="outlined" component="section" sx={{ mt: 4, p: { xs: 3, sm: 4 } }}>
+      <Typography variant="h2" className="font-display" sx={{ fontSize: '1.5rem', fontWeight: 'bold' }}>Packet templates</Typography>
+      <Typography sx={{ mt: 0.5, fontSize: '0.875rem', color: 'text.secondary' }}>
+        Active templates are added to every applicant packet, after the profile pages and the IRS W-4, in the order below.
+      </Typography>
+      {error && <Alert severity="error" sx={{ mt: 2 }}>{error}</Alert>}
+
+      <Box sx={{ mt: 3, display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 2, borderRadius: 2, border: 1, borderColor: 'divider', p: 2 }}>
+        <Button component="label" variant="outlined" startIcon={<FileText size={16} />}>
+          {file ? file.name : 'Choose PDF'}
+          <input
+            hidden
+            type="file"
+            accept="application/pdf,.pdf"
+            onChange={(e: ChangeEvent<HTMLInputElement>) => {
+              const chosen = e.target.files?.[0] ?? null;
+              setFile(chosen);
+              if (chosen && !name.trim()) setName(chosen.name.replace(/\.pdf$/i, ''));
+              e.target.value = '';
+            }}
+          />
+        </Button>
+        <TextField size="small" label="Name" value={name} onChange={(e) => setName(e.target.value)} sx={{ minWidth: 200 }} />
+        <TextField size="small" select label="Language" value={lang} onChange={(e) => setLang(e.target.value as 'en' | 'es' | 'both')} sx={{ minWidth: 140 }}>
+          <MenuItem value="both">Both</MenuItem>
+          <MenuItem value="en">English</MenuItem>
+          <MenuItem value="es">Spanish</MenuItem>
+        </TextField>
+        <TextField size="small" label="Order" type="number" value={order} onChange={(e) => setOrder(e.target.value)} sx={{ width: 100 }} />
+        <Button variant="contained" startIcon={<Plus size={16} />} disabled={!file || busy} onClick={upload}>Upload</Button>
+      </Box>
+
+      <Box sx={{ mt: 2, display: 'flex', flexDirection: 'column', gap: 1.5 }}>
+        {templates.length === 0 && <Typography sx={{ fontSize: '0.875rem', color: 'text.secondary' }}>No templates uploaded yet.</Typography>}
+        {templates.map((template) => (
+          <Box key={template.id} sx={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 1.5, borderRadius: 2, border: 1, borderColor: 'divider', p: 1.5 }}>
+            <Box sx={{ flexGrow: 1, minWidth: 200 }}>
+              <Typography sx={{ fontWeight: 'bold' }}>{template.name}</Typography>
+              <Typography sx={{ fontSize: '0.75rem', color: 'text.secondary' }}>
+                {template.pageCount} page{template.pageCount === 1 ? '' : 's'} · {formatSize(template.size)} · {template.uploadedByEmail}
+              </Typography>
+            </Box>
+            <Chip size="small" label={template.lang === 'both' ? 'EN + ES' : template.lang.toUpperCase()} />
+            <TextField
+              size="small" type="number" label="Order" defaultValue={template.order} disabled={busy} sx={{ width: 90 }}
+              onBlur={(e) => Number(e.target.value) !== template.order && patch(template.id, { order: Number(e.target.value) })}
+            />
+            <FormControlLabel
+              label="Active"
+              control={<Checkbox checked={template.active} disabled={busy} onChange={(e) => patch(template.id, { active: e.target.checked })} />}
+            />
+            <Button size="small" color="inherit" startIcon={<Download size={15} />} onClick={() => download(template)}>Download</Button>
+            <Button size="small" color="error" startIcon={<Trash2 size={15} />} disabled={busy} onClick={() => remove(template)}>Delete</Button>
+          </Box>
+        ))}
+      </Box>
+    </Paper>
+  );
+}
+
 // --- Admin ---
 
 function Admin() {
@@ -901,10 +1076,19 @@ function Admin() {
   const login = async () => {
     setError('');
     try {
-      await signInWithEmailAndPassword(requireAuth(), email, password);
+      await signInWithEmailAndPassword(firebaseAuth!, email, password);
       setPassword('');
     } catch {
       setError('Sign-in failed. Check your staff email and password.');
+    }
+  };
+
+  const loginWithGoogle = async () => {
+    setError('');
+    try {
+      await signInWithGoogle();
+    } catch {
+      setError('Google sign-in failed. Try again or use your email and password.');
     }
   };
 
@@ -943,6 +1127,8 @@ function Admin() {
           <TextField label="Password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && login()} />
           {error && <Alert severity="error">{error}</Alert>}
           <Button fullWidth variant="contained" startIcon={<LogIn size={17} />} onClick={login}>Sign in</Button>
+          <Divider>or</Divider>
+          <Button fullWidth variant="outlined" color="inherit" onClick={loginWithGoogle}>Sign in with Google</Button>
         </Box>
       </Paper>
     </Box>
@@ -992,11 +1178,12 @@ function Admin() {
           )}
         </Box>
       </Box>
+      <PdfTemplates authOptions={authOptions} />
     </Box>
   );
 }
 
-type StaffProfile = { uid: string; email: string; displayName: string; role: 'admin' | 'manager' | 'member' };
+type StaffProfile ={ uid: string; email: string; displayName: string; role: 'admin' | 'manager' | 'member' };
 type WorkTask = {
   id: string; title: string; description: string; assigneeUid: string; assigneeName: string;
   dueDate: string | null; status: 'todo' | 'in_progress' | 'completed';
@@ -1063,6 +1250,12 @@ function Tasks() {
     catch { setError(taskT('signInFailed')); }
   };
 
+  const loginWithGoogle = async () => {
+    setError('');
+    try { await signInWithGoogle(); }
+    catch { setError(taskT('googleSignInFailed')); }
+  };
+
   const createTask = async () => {
     setError('');
     try {
@@ -1100,6 +1293,8 @@ function Tasks() {
           <TextField label={taskT('password')} type="password" value={password} onChange={(e) => setPassword(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && login()} />
           {error && <Alert severity="error">{error}</Alert>}
           <Button fullWidth variant="contained" onClick={login} startIcon={<LogIn size={17}/>}>{taskT('signIn')}</Button>
+          <Divider>{taskT('or')}</Divider>
+          <Button fullWidth variant="outlined" color="inherit" onClick={loginWithGoogle}>{taskT('signInWithGoogle')}</Button>
         </Box>
       </Paper>
     </Box>
@@ -1222,7 +1417,7 @@ function Layout() {
         </Box>
 
         <Box component="footer" className="app-content" sx={{ mx: 'auto', display: 'flex', width: 1, maxWidth: 'lg', alignItems: 'center', justifyContent: 'space-between', px: { xs: 2.5, sm: 4, lg: 6 }, pb: 3, pt: 1, fontSize: '0.68rem', fontWeight: 600, color: 'text.secondary' }}>
-          <span>© {new Date().getFullYear()} Kodiak Landscaping + Construction</span>
+          <span>© {new Date().getFullYear()} Kodiak Landscaping &amp; Construction</span>
           <span>Ogden, UT</span>
         </Box>
       </Box>
