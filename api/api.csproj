@@ -1,13 +1,16 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
-
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <DefaultItemExcludes>$(DefaultItemExcludes);dist/**;Tests/**</DefaultItemExcludes>
   </PropertyGroup>
-
   <ItemGroup>
-    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.9" />
+    <PackageReference Include="FirebaseAdmin" Version="3.7.0" />
+    <PackageReference Include="Google.Cloud.Firestore" Version="4.4.0" />
+    <Compile Remove="Tests/**/*.cs" />
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.12" />
+    <PackageReference Include="PDFsharp" Version="6.2.4" />
   </ItemGroup>
-
 </Project>
